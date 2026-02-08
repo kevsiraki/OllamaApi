@@ -1,23 +1,40 @@
-﻿using Microsoft.AspNetCore.Mvc.Filters;
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace OllamaApi.Attributes
 {
     /// <summary>
     /// This attribute is used to secure API endpoints by requiring a valid API key in the request headers.
-    /// The article also provides another version which uses a custom middleware instead, which is useful if you want to secure all endpoints in the API, 
-    /// but for this project I wanted to be able to secure only specific endpoints, so I went with the attribute approach.
     /// 
-    /// Source: https://codingsonata.com/secure-asp-net-core-web-api-using-api-key-authentication/
+    /// Compared to the original source implementation:
+    /// 
+    /// Improvements include:
+    /// - Separation between header name and configuration key path.
+    /// - Proper null/empty checks for configuration values.
+    /// - Constant-time comparison using CryptographicOperations.FixedTimeEquals
+    ///   to prevent timing attacks instead of string.Equals().
+    /// 
+    /// This version keeps endpoint-level control (attribute-based security)
+    /// instead of global middleware so specific controllers can be protected.
+    /// 
+    /// Source inspiration:
+    /// https://codingsonata.com/secure-asp-net-core-web-api-using-api-key-authentication/
     /// </summary>
-
     [AttributeUsage(validOn: AttributeTargets.Class)]
     public class ApiKeyAttribute : Attribute, IAsyncActionFilter
     {
-        private const string APIKEYNAME = "ApiKey";
+        // Header expected from client requests
+        private const string HEADER_NAME = "ApiKey";
+
+        // Path inside IConfiguration where API key is stored
+        private const string CONFIG_PATH = "Configuration:ApiKey";
+
         public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
         {
-            if (!context.HttpContext.Request.Headers.TryGetValue(APIKEYNAME, out var extractedApiKey))
+            // Try retrieving API key from request headers
+            if (!context.HttpContext.Request.Headers.TryGetValue(HEADER_NAME, out var extractedApiKey))
             {
                 context.Result = new ContentResult()
                 {
@@ -27,10 +44,37 @@ namespace OllamaApi.Attributes
                 return;
             }
 
-            var appSettings = context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
-            var apiKey = appSettings.GetValue<string>(APIKEYNAME);
+            var config = context.HttpContext.RequestServices.GetRequiredService<IConfiguration>();
+            var apiKey = config[CONFIG_PATH];
 
-            if (!apiKey.Equals(extractedApiKey))
+            // Check if API key exists in configuration.
+            // Returning 500 instead of 401 because this indicates
+            // server misconfiguration rather than client error.
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                context.Result = new ContentResult()
+                {
+                    StatusCode = 500,
+                    Content = "API Key configuration missing"
+                };
+                return;
+            }
+
+            // Extract header value as string.
+            // Request headers return StringValues, so normalize to string.
+            var incomingKey = extractedApiKey.ToString();
+
+            // Convert both keys to byte arrays for constant-time comparison.
+            // This avoids timing attacks that can occur with normal string comparison.
+            var storedBytes = Encoding.UTF8.GetBytes(apiKey);
+            var incomingBytes = Encoding.UTF8.GetBytes(incomingKey);
+
+            bool isApiKeyValid = CryptographicOperations.FixedTimeEquals(
+                storedBytes,
+                incomingBytes
+            );
+
+            if (!isApiKeyValid)
             {
                 context.Result = new ContentResult()
                 {
@@ -39,6 +83,8 @@ namespace OllamaApi.Attributes
                 };
                 return;
             }
+
+            // Continue request pipeline if API key validation succeeds
             await next();
         }
     }
